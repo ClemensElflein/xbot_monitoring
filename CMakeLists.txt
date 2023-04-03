@@ -36,6 +36,17 @@ catkin_package(
 FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.2/json.tar.xz)
 FetchContent_MakeAvailable(json)
 
+# Fetch mongoose (REST server)
+FetchContent_Declare(mongoose 
+        URL https://github.com/cesanta/mongoose/archive/refs/tags/7.9.tar.gz
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ""
+)
+FetchContent_Populate(mongoose)
+
+add_library(mongoose STATIC ${mongoose_SOURCE_DIR}/mongoose.c)
+target_include_directories(mongoose PUBLIC ${mongoose_SOURCE_DIR})
+
 ###########
 ## Build ##
 ###########
@@ -50,7 +61,8 @@ add_executable(xbot_monitoring
 
 
 add_dependencies(xbot_monitoring ${catkin_EXPORTED_TARGETS} ${${PROJECT_NAME}_EXPORTED_TARGETS})
-target_link_libraries(xbot_monitoring ${catkin_LIBRARIES} ${PahoMqttCpp_LIBRARIES} nlohmann_json::nlohmann_json)
+target_link_libraries(xbot_monitoring ${catkin_LIBRARIES} ${PahoMqttCpp_LIBRARIES} nlohmann_json::nlohmann_json mongoose)
+#target_compile_definitions(xbot_monitoring PRIVATE REST_SERVER_PORT=8889)
 
 add_executable(xbot_sensor_example
         src/xbot_sensor_example.cpp)
