@@ -6,6 +6,7 @@
 
 #include "ros/ros.h"
 #include <memory>
+#include <map>
 #include <boost/regex.hpp>
 #include "xbot_msgs/SensorInfo.h"
 #include "xbot_msgs/Map.h"
@@ -19,6 +20,7 @@
 #include "xbot_msgs/RegisterActionsSrv.h"
 #include "xbot_msgs/ActionInfo.h"
 #include "xbot_msgs/MapOverlay.h"
+#include "mongoose.h"
 
 using json = nlohmann::json;
 
@@ -26,6 +28,16 @@ void publish_sensor_metadata();
 void publish_map();
 void publish_map_overlay();
 void publish_actions();
+
+// data cache for REST server responses
+struct {
+    json sensor_info = json::array();   // GET /sensors
+    std::map<std::string,std::string> sensor_data; // GET /sensors/<sensor_id>
+    json actions = json::array();       // GET /actions, POST /actions/execute
+    json robot_state = json::object();  // GET /status
+    json map = json::object();          // GET /map
+    json map_overlay = json::object();  // GET /map/overlay
+} g_CachedData;
 
 // Stores registered actions (prefix to vector<action>)
 std::map<std::string, std::vector<xbot_msgs::ActionInfo>> registered_actions;
@@ -42,6 +54,14 @@ std::shared_ptr<mqtt::async_client> client_;
 
 std::mutex mqtt_callback_mutex;
 
+// simple REST server
+#ifndef REST_SERVER_PORT
+# define REST_SERVER_PORT 8889
+#endif
+
+struct mg_mgr rest;
+std::mutex rest_mutex;
+
 // Publisher for cmd_vel and commands
 ros::Publisher cmd_vel_pub;
 ros::Publisher action_pub;
@@ -53,7 +73,6 @@ class MqttCallback : public mqtt::callback {
         publish_map();
         publish_map_overlay();
         publish_actions();
-
 
         client_->subscribe("/teleop", 0);
         client_->subscribe("/command", 0);
@@ -116,8 +135,6 @@ void setupMqttClient() {
         ROS_ERROR("Client could not be initialized: %s", e.what());
         exit(EXIT_FAILURE);
     }
-
-
 }
 
 void try_publish(std::string topic, std::string data, bool retain = false) {
@@ -150,7 +167,7 @@ void publish_sensor_metadata() {
 
     if(found_sensors.empty())
         return;
-
+    
     json sensor_info;
     for (const auto &kv: found_sensors) {
         json info;
@@ -170,8 +187,6 @@ void publish_sensor_metadata() {
                 info["value_type"] = "UNKNOWN";
                 break;
             }
-
-
         }
 
         switch (kv.second.value_description) {
@@ -220,6 +235,9 @@ void publish_sensor_metadata() {
     data["d"] = sensor_info;
     auto bson = json::to_bson(data);
     try_publish_binary("sensor_infos/bson", bson.data(), bson.size(), true);
+    
+    std::unique_lock<std::mutex> mtx(rest_mutex);
+    g_CachedData.sensor_info = sensor_info;
 }
 
 void subscribe_to_sensor(std::string topic) {
@@ -239,6 +257,9 @@ void subscribe_to_sensor(std::string topic) {
                 data["d"] = msg->data;
                 auto bson = json::to_bson(data);
                 try_publish_binary("sensors/" + info.sensor_id + "/bson", bson.data(), bson.size());
+                
+                std::unique_lock<std::mutex> mtx(rest_mutex);
+                g_CachedData.sensor_data[info.sensor_id] = std::to_string(msg->data);
             });
             sensor_data_subscribers.push_back(s);
             break;
@@ -252,6 +273,9 @@ void subscribe_to_sensor(std::string topic) {
                 data["d"] = msg->data;
                 auto bson = json::to_bson(data);
                 try_publish_binary("sensors/" + info.sensor_id + "/bson", bson.data(), bson.size());
+                
+                std::unique_lock<std::mutex> mtx(rest_mutex);
+                g_CachedData.sensor_data[info.sensor_id] = msg->data;
             });
             sensor_data_subscribers.push_back(s);
             break;
@@ -285,6 +309,9 @@ void robot_state_callback(const xbot_msgs::RobotState::ConstPtr &msg) {
     data["d"] = j;
     auto bson = json::to_bson(data);
     try_publish_binary("robot_state/bson", bson.data(), bson.size());
+    
+    std::unique_lock<std::mutex> mtx(rest_mutex);
+    g_CachedData.robot_state = j;
 }
 
 void publish_actions() {
@@ -305,6 +332,9 @@ void publish_actions() {
 
     auto bson = json::to_bson(data);
     try_publish_binary("actions/bson", bson.data(), bson.size(), true);
+    
+    std::unique_lock<std::mutex> mtx(rest_mutex);
+    g_CachedData.actions = actions;
 }
 
 void publish_map() {
@@ -315,6 +345,9 @@ void publish_map() {
     data["d"] = map;
     auto bson = json::to_bson(data);
     try_publish_binary("map/bson", bson.data(), bson.size(), true);
+    
+    std::unique_lock<std::mutex> mtx(rest_mutex);
+    g_CachedData.map = map;
 }
 
 void publish_map_overlay() {
@@ -325,6 +358,9 @@ void publish_map_overlay() {
     data["d"] = map_overlay;
     auto bson = json::to_bson(data);
     try_publish_binary("map_overlay/bson", bson.data(), bson.size(), true);
+    
+    std::unique_lock<std::mutex> mtx(rest_mutex);
+    g_CachedData.map_overlay = map_overlay;
 }
 
 void map_callback(const xbot_msgs::Map::ConstPtr &msg) {
@@ -453,6 +489,120 @@ bool registerActions(xbot_msgs::RegisterActionsSrvRequest &req, xbot_msgs::Regis
     return true;
 }
 
+
+#define REST_REPLY_200_JSON(J) \
+std::string strJson = J.dump(4); \
+mg_http_reply(c, 200, "Content-Type: application/json\r\n", strJson.c_str());
+
+#define REST_REPLY_200_TEXT(T) \
+mg_http_reply(c, 200, "Content-Type: text/plain\r\n", T.c_str());
+
+#define REST_REPLY_202 \
+mg_http_reply(c, 202, NULL, ""); // Accepted
+
+#define REST_REPLY_404 \
+mg_http_reply(c, 404, NULL, ""); // Not Found
+
+#define REST_REPLY_405 \
+mg_http_reply(c, 405, NULL, ""); // Method Not Allowed
+
+#define REST_REPLY_406 \
+mg_http_reply(c, 406, NULL, ""); // Not Acceptable
+
+static void rest_handler(struct mg_connection *c, int ev, void *ev_data, void *fn_data) {
+    if (ev == MG_EV_HTTP_MSG) { // HTTP REQUEST received
+        struct mg_http_message* hm = (struct mg_http_message *)ev_data;
+        const bool isGET = (0 == mg_ncasecmp("GET", hm->method.ptr, hm->method.len));
+        const bool isPOST = (0 == mg_ncasecmp("POST", hm->method.ptr, hm->method.len));
+
+        if (mg_http_match_uri(hm, "/sensors/#")) {
+            if (mg_http_match_uri(hm, "/sensors/*/#")) {
+                REST_REPLY_404
+            }
+            else {
+                mg_str cap[2];
+                if (mg_match(hm->uri, mg_str("/sensors/*"), cap)) {
+                    std::string sensor_id(cap[0].ptr,cap[0].len);
+                    std::unique_lock<std::mutex> mtx(rest_mutex);
+                    if (g_CachedData.sensor_data.find(sensor_id) == g_CachedData.sensor_data.end()) {
+                        REST_REPLY_404
+                    }
+                    else {
+                        REST_REPLY_200_TEXT(g_CachedData.sensor_data[sensor_id])
+                    }
+                }
+            }
+        }
+        else if (mg_http_match_uri(hm, "/sensors")) {
+            if (isGET) {
+                std::unique_lock<std::mutex> mtx(rest_mutex);
+                REST_REPLY_200_JSON(g_CachedData.sensor_info)
+            }
+            else {
+                REST_REPLY_405
+            }
+        } else if (mg_http_match_uri(hm, "/actions/execute")) {
+            if (isPOST) {
+                std::string strAction = std::string(hm->body.ptr,hm->body.len);
+                if (strAction.length() > 0) {
+                    /*
+                    json action_info;
+                    action_info["action_id"] = kv.first + "/" + action.action_id;
+                    action_info["action_name"] = action.action_name;
+                    action_info["enabled"] = action.enabled;
+                    */
+                    ROS_INFO_STREAM("REST: POST action: " + strAction);
+                    std_msgs::String action_msg;
+                    action_msg.data = strAction;
+                    action_pub.publish(action_msg);
+                    REST_REPLY_202
+                }
+                else {
+                    REST_REPLY_406
+                }
+            }
+            else {
+                REST_REPLY_405
+            }
+        } else if (mg_http_match_uri(hm, "/actions")) {
+            if (isGET) {
+                std::unique_lock<std::mutex> mtx(rest_mutex);
+                REST_REPLY_200_JSON(g_CachedData.actions)
+            }
+            else {
+                REST_REPLY_405
+            }
+        } else if (mg_http_match_uri(hm, "/status")) {
+            if (isGET) {
+                std::unique_lock<std::mutex> mtx(rest_mutex);
+                REST_REPLY_200_JSON(g_CachedData.robot_state)
+            }
+            else {
+                REST_REPLY_405
+            }
+        } else if (mg_http_match_uri(hm, "/map/overlay")) {
+            if (isGET) {
+                std::unique_lock<std::mutex> mtx(rest_mutex);
+                REST_REPLY_200_JSON(g_CachedData.map_overlay)
+            }
+            else {
+                REST_REPLY_405
+            }
+        } else if (mg_http_match_uri(hm, "/map")) {
+            if (isGET) {
+                std::unique_lock<std::mutex> mtx(rest_mutex);
+                REST_REPLY_200_JSON(g_CachedData.map)
+            }
+            else {
+                REST_REPLY_405
+            }
+        } else {
+            REST_REPLY_404
+        }
+    }
+}
+
+
 int main(int argc, char **argv) {
     ros::init(argc, argv, "xbot_monitoring");
     has_map = false;
@@ -460,11 +610,17 @@ int main(int argc, char **argv) {
 
     // First setup MQTT
     setupMqttClient();
-
+    
+    // simple REST server
+    mg_mgr_init(&rest);
+    
+    char rest_server_address[22];
+    snprintf(rest_server_address, sizeof(rest_server_address)-1, "http://0.0.0.0:%d", REST_SERVER_PORT);
+    
+    mg_http_listen(&rest, rest_server_address, rest_handler, &rest);
 
     n = new ros::NodeHandle();
     ros::NodeHandle paramNh("~");
-
 
     ros::ServiceServer register_action_service = n->advertiseService("xbot/register_actions", registerActions);
 
@@ -518,7 +674,9 @@ int main(int argc, char **argv) {
                 }
             }
         });
+        mg_mgr_poll(&rest, 10); // http server event loop poll
         sensor_check_rate.sleep();
     }
+    
     return 0;
 }
