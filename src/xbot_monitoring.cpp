@@ -288,6 +288,10 @@ void publish_sensor_metadata() {
                 info["value_description"] = "PERCENT";
                 break;
             }
+            case xbot_msgs::SensorInfo::VALUE_DESCRIPTION_RPM: {
+                info["value_description"] = "REVOLUTIONS";
+                break;
+            }
             default: {
                 info["value_description"] = "UNKNOWN";
                 break;
