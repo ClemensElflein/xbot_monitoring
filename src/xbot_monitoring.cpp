@@ -173,7 +173,7 @@ void setupMqttClient() {
 
         try {
             client_external_ = std::make_shared<mqtt::async_client>(
-                    uri, "ext_xbot_monitoring");
+                    uri, "ext_xbot_monitoring_" + external_mqtt_topic_prefix);
             mqtt_callback_external.setMqttClient(client_external_, external_mqtt_topic_prefix);
             client_external_->set_callback(mqtt_callback_external);
 
